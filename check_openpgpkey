@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2017 Pierre-Olivier Mercier <nemunaire@nemunai.re>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 or (at your option)
+# version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import argparse
+import base64
+import datetime
+import dns.message
+import dns.query
+import dns.resolver
+import hashlib
+import re
+import socket
+import struct
+import ssl
+import subprocess
+import sys
+import tempfile
+
+
+VERSION = "0.1"
+
+
+# NAGIOS FORMATED MESSAGES ############################################
+
+def nagios_ok(msg):
+    print("OPENPGPKEY OK - " + msg)
+    sys.exit(0)
+
+def nagios_warning(msg):
+    print("OPENPGPKEY WARNING - " + msg)
+    sys.exit(1)
+
+def nagios_critical(msg):
+    print("OPENPGPKEY CRITICAL - " + msg)
+    sys.exit(2)
+
+def nagios_unknown(msg):
+    print("OPENPGPKEY UNKONWN - " + msg)
+    sys.exit(3)
+
+
+# INTERNAL STUFF ######################################################
+
+class Resolver(dns.resolver.Resolver):
+
+    def __init__(self, dnssec=True, timeout=None, resolver=None):
+        super().__init__()
+
+        if timeout:
+            self.lifetime = timeout
+
+        if resolver:
+            self.nameservers = [resolver]
+
+        self._dnssec = dnssec
+        if dnssec:
+            self.edns = 0
+            self.payload = 1280
+            self.ednsflags = dns.flags.DO
+
+    def check_dns_response_auth(response):
+        if response.response.flags & dns.flags.AD:
+            return True
+        else:
+            return False
+
+    def get_openpgp_records(self, domain):
+        try:
+            opk_records = self.query(domain, "TYPE61")
+        except dns.resolver.NXDOMAIN:
+            nagios_critical("No DNS OPENPGPKEY record found: {}".format(domain))
+        except dns.exception.Timeout:
+            nagios_unknown("DNS query timeout: {}".format(domain))
+
+        if self._dnssec and not Resolver.check_dns_response_auth(opk_records):
+            nagios_unknown("DNS query not DNSSEC validated")
+
+        return opk_records
+
+class OpenPGPKey:
+
+    def __init__(self, keyalgo, keyid, name=None, email=None, creation_time=None, expiration_time=None):
+        self._keyalgo = keyalgo
+        self._keyid = keyid
+        self._creation_time = creation_time
+        self._name = name
+        self._email = email
+        self._expiration_time = expiration_time
+
+
+def extract_key(record):
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        with subprocess.Popen(["gpg",
+                               "--homedir=" + tmpdirname,
+                               "--verbose",
+                               "--batch",
+                               "--import",
+                               "-"], env={"LANG": 'C'}, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+            p.stdin.write(b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n")
+            p.stdin.write(base64.b64encode(record.data))
+            p.stdin.write(b"-----END PGP PUBLIC KEY BLOCK-----\n")
+            p.stdin.close()
+            p.wait()
+            gpg_output = p.stderr.read().decode()
+
+            # filter output
+            gpg_output = "\n".join([r.replace("gpg: ", "") for r in gpg_output.split("\n") if r and not re.match(r".*(Total number processed|created).*", r)])
+
+            if p.returncode:
+                nagios_critical(gpg_output)
+            else:
+                key = None
+                for line in gpg_output.split("\n"):
+                    res = re.match(r"^pub\s+(?P<algoid>(?P<algo>[^/]+)/(?P<id>\S+))\s+(?P<creation>\S+)\s+(?P<porter>[^<]*[^< ])\s+<(?P<email>[^>]+)>", line)
+                    if res:
+                        key = OpenPGPKey(
+                            res.group("algo"),
+                            res.group("id"),
+                            creation_time=datetime.datetime.strptime(res.group("creation"), "%Y-%m-%d"),
+                            name=res.group("porter"),
+                            email=res.group("email")
+                        )
+                        continue
+
+                    res = re.match(r"^.*signature key\s+(?P<id>\S+)\s+expired\s+(?P<exptime>.+)$", line) # Fri Jul  1 19:34:52 2016 CEST
+                    if res:
+                        key._expiration_time = datetime.datetime.strptime(re.sub(r"^(\S+\s+\S+)(\s+\s)([0-9]\s)", r"\1 0\3", res.group("exptime")), "%a %b %d %H:%M:%S %Y %Z")
+
+                return key
+
+
+# CHECK FUNCTIONS #####################################################
+
+def check_key_expiry(key, days_critical, days_warning=None):
+    date_diff = key._expiration_time - datetime.datetime.now()
+
+    if date_diff <= datetime.timedelta(days_critical):
+        nagios_critical("0x{} key expires in {} days".format(key._keyid, date_diff.days))
+
+    if days_warning:
+        if date_diff <= datetime.timedelta(days_warning):
+            nagios_warning("0x{} key expires in {} days".format(key._keyid, date_diff.days))
+
+    return date_diff
+
+
+# MAIN ################################################################
+
+def main():
+    parser = argparse.ArgumentParser(description="Nagios/Icinga plugin for checking OPENPGPKEY records.")
+
+    parser.add_argument("--id", "-I", action="append", help="Expect this key id.")
+    parser.add_argument("--remaining-days", "-R",
+                        help="Minimum remaining days before expiry. Format: INTEGER[,INTEGER]."
+                        " 1st is days for warning, 2nd is critical.")
+    parser.add_argument("--no-dnssec", dest="dnssec", action="store_false",
+                        help="Continue even when DNS replies aren't DNSSEC authenticated.")
+    parser.add_argument("--resolver", help="Use a custom resolver.")
+    parser.add_argument("--timeout", type=int, default=10, help="Network timeone in sec. Default: 10")
+    parser.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    parser.add_argument("email", help="Adress to check.")
+    args = parser.parse_args()
+
+    pyver = sys.version_info
+    if pyver[0] < 3 or (pyver[0] == 3 and pyver[1] < 3):
+        nagios_unknown("Python >= 3.3 required")
+
+    if args.timeout < 0:
+        nagios_unknown("Invalid timeout argument")
+
+    username, domain = args.email.split("@")
+
+    # Calculate the record subdomain
+    #subdomain = base64.b32encode(username.encode()).decode().lower()  # draft 1 & 2
+    #subdomain = hashlib.sha224(username.encode()).hexdigest()  # draft 3
+    subdomain = hashlib.sha256(username.encode()).hexdigest()[:56]  # RFC 7929
+
+    # Get OPENPGPKEY records
+    resolver = Resolver(dnssec=args.dnssec, timeout=args.timeout, resolver=args.resolver)
+    opk_records = resolver.get_openpgp_records(subdomain + "._openpgpkey." + domain)
+
+    # Retrieve all keys
+    keys = {}
+    for record in opk_records:
+        k = extract_key(record)
+        keys[k._keyid] = k
+
+    # Check all key-IDs
+    if args.id:
+        for kid in args.id:
+            if kid.replace("0x", "") not in keys:
+                nagios_critical("Key 0x{} not found for {}@{}".format(kid, username, domain))
+
+    message = "{} key(s) found in OPENPGPKEY record".format(len(args.id) if args.id else len(opk_records))
+    if not args.dnssec:
+        message += " (DNSSEC not validated)"
+
+    # Check key expiry
+    if args.remaining_days:
+        days_parts = args.remaining_days.split(",")
+
+        for k in keys:
+            if len(days_parts) == 2:
+                timedelta_valid = check_key_expiry(keys[k], int(days_parts[1]), int(days_parts[0]))
+            else:
+                timedelta_valid = check_key_expiry(keys[k], int(days_parts[0]))
+
+        message += ", expires in {} days".format(timedelta_valid.days)
+
+    # Should be fine!
+    nagios_ok(message)
+
+if __name__ == "__main__":
+    main()
