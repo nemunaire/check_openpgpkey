@@ -31,7 +31,7 @@ import sys
 import tempfile
 
 
-VERSION = "0.1"
+VERSION = "0.2"
 
 
 # NAGIOS FORMATED MESSAGES ############################################
@@ -102,45 +102,57 @@ class OpenPGPKey:
         self._expiration_time = expiration_time
 
 
-def extract_key(record):
-    with tempfile.TemporaryDirectory() as tmpdirname:
-        with subprocess.Popen(["gpg",
-                               "--homedir=" + tmpdirname,
-                               "--verbose",
-                               "--batch",
-                               "--import",
-                               "-"], env={"LANG": 'C'}, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
-            p.stdin.write(b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n")
-            p.stdin.write(base64.b64encode(record.data))
-            p.stdin.write(b"-----END PGP PUBLIC KEY BLOCK-----\n")
-            p.stdin.close()
-            p.wait()
-            gpg_output = p.stderr.read().decode()
+def extract_key(record, gpghomedir):
+    with subprocess.Popen(["gpg",
+                           "--homedir=" + gpghomedir,
+                           "--verbose",
+                           "--batch",
+                           "--import",
+                           "-"], env={"LANG": 'C'}, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+        p.stdin.write(b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n")
+        p.stdin.write(base64.b64encode(record.data))
+        p.stdin.write(b"-----END PGP PUBLIC KEY BLOCK-----\n")
+        p.stdin.close()
+        p.wait()
+        gpg_output = p.stderr.read().decode()
 
-            # filter output
-            gpg_output = "\n".join([r.replace("gpg: ", "") for r in gpg_output.split("\n") if r and not re.match(r".*(Total number processed|created).*", r)])
+        # filter output
+        gpg_output = "\n".join([r.replace("gpg: ", "") for r in gpg_output.split("\n") if r and not re.match(r".*(Total number processed|created).*", r)])
 
-            if p.returncode:
-                nagios_critical(gpg_output)
-            else:
-                key = None
-                for line in gpg_output.split("\n"):
-                    res = re.match(r"^pub\s+(?P<algoid>(?P<algo>[^/]+)/(?P<id>\S+))\s+(?P<creation>\S+)\s+(?P<porter>[^<]*[^< ])\s+<(?P<email>[^>]+)>", line)
-                    if res:
-                        key = OpenPGPKey(
-                            res.group("algo"),
-                            res.group("id"),
-                            creation_time=datetime.datetime.strptime(res.group("creation"), "%Y-%m-%d"),
-                            name=res.group("porter"),
-                            email=res.group("email")
-                        )
-                        continue
+        if p.returncode:
+            nagios_critical(gpg_output)
+        else:
+            key = None
+            for line in gpg_output.split("\n"):
+                res = re.match(r"^pub\s+(?P<algoid>(?P<algo>[^/]+)/(?P<id>\S+))\s+(?P<creation>\S+)\s+(?P<porter>[^<]*[^< ])\s+<(?P<email>[^>]+)>", line)
+                if res:
+                    key = OpenPGPKey(
+                        res.group("algo"),
+                        res.group("id"),
+                        creation_time=datetime.datetime.strptime(res.group("creation"), "%Y-%m-%d"),
+                        name=res.group("porter"),
+                        email=res.group("email")
+                    )
+                    continue
 
-                    res = re.match(r"^.*signature key\s+(?P<id>\S+)\s+expired\s+(?P<exptime>.+)$", line) # Fri Jul  1 19:34:52 2016 CEST
-                    if res:
-                        key._expiration_time = datetime.datetime.strptime(re.sub(r"^(\S+\s+\S+)(\s+\s)([0-9]\s)", r"\1 0\3", res.group("exptime")), "%a %b %d %H:%M:%S %Y %Z")
+            return key
 
-                return key
+def get_key_expiry(key, gpghomedir):
+    with subprocess.Popen(["gpg",
+                           "--homedir=" + gpghomedir,
+                           "--list-key",
+                           key._keyid], env={"LANG": 'C'}, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
+        p.wait()
+        gpg_output = p.stdout.read().decode()
+
+        if p.returncode:
+            nagios_critical(gpg_output)
+        else:
+            for line in gpg_output.split("\n"):
+                res = re.match(r"^pub\s+(?P<algo>\S+)\s+(?P<creation>\S+)\s+\[(?P<types>[^\]]+)\]\s+\[expire[sd]: (?P<expiry>[^\]]+)\]", line)
+                if res:
+                    key._expiration_time = datetime.datetime.strptime(res.group("expiry"), "%Y-%m-%d")
+
 
 
 # CHECK FUNCTIONS #####################################################
@@ -196,8 +208,11 @@ def main():
     # Retrieve all keys
     keys = {}
     for record in opk_records:
-        k = extract_key(record)
-        keys[k._keyid] = k
+        with tempfile.TemporaryDirectory() as gpghomedir:
+            k = extract_key(record, gpghomedir)
+            if k is not None:
+                get_key_expiry(k, gpghomedir)
+                keys[k._keyid] = k
 
     # Check all key-IDs
     if args.id:
