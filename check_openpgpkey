@@ -31,7 +31,7 @@ import sys
 import tempfile
 
 
-VERSION = "0.2"
+VERSION = "0.3"
 
 
 # NAGIOS FORMATED MESSAGES ############################################
@@ -110,7 +110,10 @@ def extract_key(record, gpghomedir):
                            "--import",
                            "-"], env={"LANG": 'C'}, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as p:
         p.stdin.write(b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n")
-        p.stdin.write(base64.b64encode(record.data))
+        if "key" in record.__dict__:
+            p.stdin.write(base64.b64encode(record.key))
+        else:
+            p.stdin.write(base64.b64encode(record.data))
         p.stdin.write(b"-----END PGP PUBLIC KEY BLOCK-----\n")
         p.stdin.close()
         p.wait()
